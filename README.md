@@ -7,23 +7,25 @@
 每个工具一个目录，目录名遵循：
 
 ```
-v<YYYYMMDD>-<工具名>-v<版本>
+v<YYYYMMDD>-<工具名>
 ```
 
 - `v<YYYYMMDD>`：日期版本 —— 记录编写当天（如 `v20260814` = 2026-08-14）
 - `<工具名>`：工具名称
-- `v<版本>`：真正的工具版本号
 
-示例：`v20260814-dsh-windows-service-v1.0` = 2026-08-14 为 dsh 写的「Windows 系统服务」工具，版本 v1.0。
+工具的**真正版本号不打在目录名里**，而是在发版时用 git tag 标记，如 `v1.0`、`v1.1`。
+
+示例：`v20260814-dsh-windows-service` = 2026-08-14 为 dsh 写的「Windows 系统服务」工具，发版 tag 为 `v1.0`。
 
 ## 工具列表
 
-| 目录 | 日期 | 版本 | 平台 | 说明 |
+| 目录 | 日期 | 版本(tag) | 平台 | 说明 |
 | --- | --- | --- | --- | --- |
-| [v20260814-dsh-windows-service-v1.0](v20260814-dsh-windows-service-v1.0/) | 2026-08-14 | v1.0 | Windows / Linux | dsh web 开机自动启动工具。Windows 用计划任务（At logon，无需管理员），Linux 用 systemd 单元；一键安装/卸载，端口冲突自动让行，崩溃自动重启，日志落盘 |
+| [v20260814-dsh-windows-service](v20260814-dsh-windows-service/) | 2026-08-14 | v1.0 | Windows / Linux | dsh web 开机自动启动工具。Windows 用计划任务（At logon，无需管理员），Linux 用 systemd 单元；一键安装/卸载，端口冲突自动让行，崩溃自动重启，日志落盘 |
 
 ## 新增工具
 
-1. 新建目录：`v$(date +%Y%m%d)-<工具名>-v<版本>`
+1. 新建目录：`v$(date +%Y%m%d)-<工具名>`
 2. 工具目录内附 `README.md` 说明用法
 3. 更新本文件的工具列表（表格）
+4. 发版时打 tag：`git tag v1.0 && git push origin v1.0`

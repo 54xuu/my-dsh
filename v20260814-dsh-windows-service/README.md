@@ -27,7 +27,7 @@ Both scripts share the same behavior contract:
 Prerequisites: Node.js on PATH. No admin required.
 
 ```powershell
-cd v20260814-dsh-windows-service-v1.0
+cd v20260814-dsh-windows-service
 
 .\install.ps1              # one-time setup (see below) and register the task
 .\install.ps1 test-start   # non-destructive smoke test on :3081 (HTTP 200 then stop)
@@ -65,7 +65,7 @@ Prerequisites: systemd, Node.js, and dsh resolvable for the target user
 (`npm i -g @deepseek-ai/dsh` is the recommended install method).
 
 ```bash
-cd v20260814-dsh-windows-service-v1.0
+cd v20260814-dsh-windows-service
 chmod +x install.sh
 
 ./install.sh              # detect paths, write unit, systemctl enable --now (self-elevates)
