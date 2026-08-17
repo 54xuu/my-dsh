@@ -21,7 +21,7 @@ v<YYYYMMDD>-<工具名>
 
 | 目录 | 日期 | 版本(tag) | 平台 | 说明 |
 | --- | --- | --- | --- | --- |
-| [v20260814-dsh-windows-service](v20260814-dsh-windows-service/) | 2026-08-14 | v1.0 | Windows / Linux | dsh web 开机自动启动工具。Windows 用计划任务（At logon，无需管理员），Linux 用 systemd 单元；一键安装/卸载，端口冲突自动让行，崩溃自动重启，日志落盘 |
+| [v20260814-dsh-windows-service](v20260814-dsh-windows-service/) | 2026-08-14 | v1.0 | Windows / Linux | dsh web 开机自动启动工具。Windows 为真正的系统服务（NSSM 封装 node，开机自启、崩溃自动重启、services.msc 可手动重启），Linux 用 systemd 单元；安装脚本自动「停旧 → 装新 → 启动」，日志轮转落盘 |
 
 ## 新增工具
 

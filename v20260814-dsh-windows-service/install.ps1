@@ -1,67 +1,81 @@
-<#
+﻿<#
 .SYNOPSIS
-    Auto-start the DeepSeek Harness web UI (dsh web) at logon on Windows,
-    using a Task Scheduler "At logon" task (no admin required).
+    Install dsh web (DeepSeek Harness browser UI) as a REAL Windows service
+    so it starts automatically at boot and can be managed manually
+    (services.msc / net stop|start / Restart-Service).
 
 .DESCRIPTION
-    install  - one-time setup: npm i -g @deepseek-ai/dsh, write config +
-              launcher under %LOCALAPPDATA%\dsh-service, register the
-              "At logon" scheduled task, then start it if port is free.
-    start    - run the scheduled task now (leaves an existing listener alone)
-    stop     - stop the scheduled task and kill whatever listens on the port
-    restart  - stop + start
-    status   - show task state, port listener, dsh version
-    uninstall- remove the task, stop the server, delete %LOCALAPPDATA%\dsh-service
-              (pass -RemoveGlobalDsh to also `npm uninstall -g @deepseek-ai/dsh`)
-    test-start - spawn dsh web on a spare port (default 3081), verify HTTP 200,
-              then shut it down. Does NOT touch the configured port.
+    Mechanism: NSSM wraps node.exe running dsh's bin.js as a service named
+    'dsh-web' under the LocalSystem account, with the user environment
+    (USERPROFILE / HOME / DSH_HOME / PATH) injected explicitly so dsh finds
+    your config and credentials. NSSM gives auto-restart on crash + log
+    rotation. Requires elevation (the script self-elevates via UAC).
+
+    Install order (as requested):
+      1. stop anything currently listening on the port (kills the old
+         instance, including a manual `dsh web` you may have running)
+      2. cleanup: unregister the old at-logon scheduled task (previous
+         approach), remove any existing 'dsh-web' service (idempotent)
+      3. ensure global @deepseek-ai/dsh + NSSM
+      4. install + configure the service (auto start at boot)
+      5. start the service
+      6. verify http://127.0.0.1:<port> answers
+
+    Commands:  install | start | stop | restart | status | uninstall
 
 .PARAMETER Command
-    install | start | stop | restart | status | uninstall | test-start
+    install (default) | start | stop | restart | status | uninstall
 
 .PARAMETER Port
-    Port dsh web should listen on (default 3080). Used by install/status/stop.
+    Listen port (default 3080).
 
 .PARAMETER HostAddr
     Bind host (default 127.0.0.1).
 
-.PARAMETER TaskName
-    Scheduled task name (default dsh-web-autostart).
-
-.PARAMETER TestPort
-    Port used by test-start (default 3081).
+.PARAMETER NssmPath
+    Path to an existing nssm.exe (skips download). Useful when offline.
 
 .EXAMPLE
-    .\install.ps1                 # install everything
-    .\install.ps1 test-start      # non-destructive smoke test on :3081
-    .\install.ps1 restart         # force restart of the dsh web instance
-    .\install.ps1 uninstall -RemoveGlobalDsh
+    .\install.ps1            # stop 3080 -> install service -> start -> verify
+    .\install.ps1 status     # service state + port listener
+    .\install.ps1 restart    # manual restart (same as: net stop dsh-web && net start dsh-web)
+    .\install.ps1 uninstall
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('install', 'start', 'stop', 'restart', 'status', 'uninstall', 'test-start')]
+    [ValidateSet('install', 'start', 'stop', 'restart', 'status', 'uninstall')]
     [string]$Command = 'install',
 
     [int]$Port = 3080,
     [string]$HostAddr = '127.0.0.1',
-    [string]$TaskName = 'dsh-web-autostart',
-    [int]$TestPort = 3081,
-    [switch]$RemoveGlobalDsh
+    [string]$NssmPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$svcName = 'dsh-web'
+$svcDir  = Join-Path $env:LOCALAPPDATA 'dsh-service'
+$logFile = Join-Path $svcDir 'install.log'
 
-# ---- paths -----------------------------------------------------------------
-$svcDir     = Join-Path $env:LOCALAPPDATA 'dsh-service'
-$configPath = Join-Path $svcDir 'config.json'
-$launcher   = Join-Path $svcDir 'dsh-web-launcher.ps1'
-$serviceLog = Join-Path $svcDir 'dsh-web.log'
+# ---- self-elevate via UAC -------------------------------------------------
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())
+    .IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), $Command)
+    if ($PSBoundParameters.ContainsKey('Port'))     { $argList += @('-Port', "$Port") }
+    if ($PSBoundParameters.ContainsKey('HostAddr')) { $argList += @('-HostAddr', $HostAddr) }
+    if ($PSBoundParameters.ContainsKey('NssmPath')) { $argList += @('-NssmPath', $NssmPath) }
+    Write-Host '需要管理员权限，正在弹出 UAC 确认窗口...'
+    Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList $argList -Verb RunAs -Wait
+    exit $LASTEXITCODE
+}
 
+# ---- helpers ---------------------------------------------------------------
 function Write-Log {
     param([string]$Message)
     $line = "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-    try { Add-Content -LiteralPath $serviceLog -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
+    try { Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
     Write-Host $line
 }
 
@@ -72,227 +86,168 @@ function Get-PortOwner {
     return $null
 }
 
-function Get-DshVersion {
-    $binJs = (Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json).binJs
-    $pkg = Join-Path (Split-Path (Split-Path $binJs -Parent) -Parent) 'package.json'
-    if (Test-Path -LiteralPath $pkg) {
-        return (Get-Content -Raw -LiteralPath $pkg | ConvertFrom-Json).version
+function Get-Nssm {
+    $binDir = Join-Path $svcDir 'bin'
+    $cached = Join-Path $binDir 'nssm.exe'
+    if (Test-Path -LiteralPath $cached) { return $cached }
+    if ($NssmPath -and (Test-Path -LiteralPath $NssmPath)) { return (Resolve-Path $NssmPath).Path }
+
+    New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+    $zip = Join-Path $binDir 'nssm-2.24.zip'
+    Write-Log 'downloading NSSM 2.24 from nssm.cc ...'
+    Invoke-WebRequest -Uri 'https://nssm.cc/release/nssm-2.24.zip' -OutFile $zip -UseBasicParsing -TimeoutSec 90
+    if (-not (Test-Path -LiteralPath $zip)) {
+        throw 'NSSM 下载失败。请手动下载 nssm-2.24 (https://nssm.cc/download) 并将 nssm.exe 用 -NssmPath 传入'
     }
-    return 'unknown'
+    Expand-Archive -LiteralPath $zip -DestinationPath $binDir -Force
+    $exe = Get-ChildItem -Path $binDir -Recurse -Filter 'nssm.exe' | Where-Object { $_.FullName -match 'win64' } | Select-Object -First 1
+    if (-not $exe) { throw '压缩包中未找到 win64/nssm.exe' }
+    Move-Item -LiteralPath $exe.FullName -Destination $cached -Force
+    Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $binDir 'nssm-2.24') -Recurse -Force -ErrorAction SilentlyContinue
+    return $cached
 }
-
-# ---- launcher template (written verbatim, reads config.json) ---------------
-$launcherTemplate = @'
-# dsh-web auto-start launcher (generated by install.ps1; do not edit)
-param(
-    [int]$Port = -1,
-    [string]$HostAddr = $null,
-    [switch]$NoBlock
-)
-$ErrorActionPreference = 'Stop'
-
-$cfg = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'config.json') | ConvertFrom-Json
-if ($Port -le 0)     { $Port = [int]$cfg.port }
-if ([string]::IsNullOrEmpty($HostAddr)) { $HostAddr = [string]$cfg.host }
-
-$log = Join-Path $cfg.logDir 'dsh-web.log'
-function Write-Log([string]$m) {
-    $line = "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m
-    try { Add-Content -LiteralPath $log -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
-}
-
-Write-Log "launcher start: host=$HostAddr port=$Port"
-
-# mirror the interactive default (dsh uses $HOME/.dsh when DSH_HOME is unset)
-if (-not $env:DSH_HOME) { $env:DSH_HOME = Join-Path $env:USERPROFILE '.dsh' }
-
-# 1) port already served? leave the existing instance alone (never kill a live session)
-$listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-if ($listener) {
-    Write-Log "port $Port already listening (pid $($listener[0].OwningProcess)); exiting without action."
-    exit 0
-}
-
-# 2) sanity checks
-if (-not (Test-Path -LiteralPath $cfg.nodePath)) { Write-Log "node not found: $($cfg.nodePath)"; exit 1 }
-if (-not (Test-Path -LiteralPath $cfg.binJs))    { Write-Log "dsh bin.js not found: $($cfg.binJs)";    exit 1 }
-
-# 3) spawn dsh web hidden, redirect output to per-run log files
-$stdout = Join-Path $cfg.logDir 'dsh-web.stdout.log'
-$stderr = Join-Path $cfg.logDir 'dsh-web.stderr.log'
-Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
-
-try {
-    $proc = Start-Process -FilePath $cfg.nodePath `
-        -ArgumentList @($cfg.binJs, 'web', '--host', $HostAddr, '--port', "$Port") `
-        -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
-    Write-Log "started dsh web pid=$($proc.Id)"
-} catch {
-    Write-Log "failed to start dsh web: $($_.Exception.Message)"
-    exit 1
-}
-
-if ($NoBlock) { exit 0 }
-
-# block so the task shows "Running"; propagate the exit code so the task's
-# restart-on-failure policy can react to a crashed server
-$proc.WaitForExit()
-$code = $proc.ExitCode
-Write-Log "dsh web exited code=$code"
-exit $code
-'@
 
 # ---- commands --------------------------------------------------------------
 function Invoke-Install {
-    Write-Log "installing dsh web auto-start (task='$TaskName', ${HostAddr}:$Port)"
+    Write-Log "=== dsh-web service install (${HostAddr}:$Port, service='$svcName') ==="
 
-    # 1) resolve node
+    # 1) stop whatever listens on the port (required by design)
+    $owner = Get-PortOwner -P $Port
+    if ($owner) {
+        Write-Log "stopping existing listener on port $Port (pid $owner)..."
+        Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+    } else {
+        Write-Log "port $Port is free."
+    }
+
+    # 2) cleanup the old at-logon scheduled task (previous approach) and any old service
+    Unregister-ScheduledTask -TaskName 'dsh-web-autostart' -Confirm:$false -ErrorAction SilentlyContinue
+    if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
+        Write-Log "removing existing service '$svcName' (reinstall)..."
+        sc.exe stop $svcName 2>$null | Out-Null
+        sc.exe delete $svcName 2>$null | Out-Null
+        Start-Sleep -Seconds 1
+    }
+
+    # 3) ensure global dsh CLI + resolve node/bin.js
     $nodeCmd = Get-Command node -ErrorAction Stop | Select-Object -First 1
     $nodePath = $nodeCmd.Source
-    Write-Log "node: $nodePath"
-
-    # 2) ensure the dsh CLI is installed globally (survives npx cache pruning)
-    $npmBin = Join-Path (Split-Path $nodePath -Parent) 'dsh.cmd'
+    $nodeDir  = Split-Path $nodePath -Parent
+    $npmBin   = Join-Path $nodeDir 'dsh.cmd'
     if (-not (Test-Path -LiteralPath $npmBin)) {
-        Write-Log "global dsh not found; running: npm install -g @deepseek-ai/dsh"
+        Write-Log 'global dsh not found; running: npm install -g @deepseek-ai/dsh'
         & npm install -g @deepseek-ai/dsh
         if ($LASTEXITCODE -ne 0) { throw "npm install -g @deepseek-ai/dsh failed (exit $LASTEXITCODE)" }
     }
-    $globalRoot = (& npm root -g).Trim()
-    $binJs = Join-Path $globalRoot '@deepseek-ai\dsh\lib\bin.js'
-    if (-not (Test-Path -LiteralPath $binJs)) { throw "dsh package not found at: $binJs" }
-    Write-Log "dsh bin.js: $binJs"
+    $binJs = Join-Path ((& npm root -g).Trim()) '@deepseek-ai\dsh\lib\bin.js'
+    if (-not (Test-Path -LiteralPath $binJs)) { throw "dsh bin.js not found: $binJs" }
+    Write-Log "node : $nodePath"
+    Write-Log "dsh  : $binJs"
 
-    # 3) write config + launcher
-    New-Item -ItemType Directory -Force -Path $svcDir | Out-Null
-    $cfg = @{
-        taskName = $TaskName
-        nodePath = $nodePath
-        binJs    = $binJs
-        host     = $HostAddr
-        port     = $Port
-        logDir   = $svcDir
-    } | ConvertTo-Json
-    Set-Content -LiteralPath $configPath -Value $cfg -Encoding UTF8
-    Set-Content -LiteralPath $launcher -Value $launcherTemplate -Encoding UTF8
-    Write-Log "config+launcher written under $svcDir"
+    # 4) ensure NSSM
+    $nssm = Get-Nssm
+    Write-Log "nssm : $nssm"
 
-    # 4) register the at-logon task (current user, interactive, hidden, no admin)
-    $action = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" `
-        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`""
-    $trigger   = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-    $settings  = New-ScheduledTaskSettingsSet `
-        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -MultipleInstances IgnoreNew
-    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-    Write-Log "scheduled task '$TaskName' registered (runs at logon of $env:USERNAME)"
+    # 5) install + configure the service
+    Write-Log 'installing service...'
+    & $nssm install $svcName $nodePath "$binJs web --host $HostAddr --port $Port"
+    if ($LASTEXITCODE -ne 0) { throw "nssm install failed (exit $LASTEXITCODE)" }
 
-    Write-Host ""
-    Write-Host "Installed. dsh web will start automatically at your next logon."
-    Write-Host "  - verify now (non-destructive, port $TestPort): .\install.ps1 test-start"
-    Write-Host "  - force start now:                           .\install.ps1 start"
-    Write-Host "  - show state:                                .\install.ps1 status"
-    Write-Host "  - logs:                                      $svcDir"
-}
+    $dshHome = Join-Path $env:USERPROFILE '.dsh'
+    $logsDir = Join-Path $svcDir 'logs'
+    New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 
-function Invoke-Start {
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $task) { throw "task '$TaskName' not installed; run: .\install.ps1 install" }
-    Start-ScheduledTask -TaskName $TaskName
-    Write-Log "started scheduled task '$TaskName'"
-    Start-Sleep -Seconds 3
-    $pid_ = Get-PortOwner -P $Port
-    if ($pid_) { Write-Log "dsh web listening on ${HostAddr}:$Port (pid $pid_)" }
-    else       { Write-Log "nothing listening on $Port yet (a running instance may already own it, or dsh is still starting)" }
-}
+    & $nssm set $svcName AppDirectory $svcDir | Out-Null
+    & $nssm set $svcName AppEnvironmentExtra `
+        "USERPROFILE=$env:USERPROFILE" `
+        "HOME=$env:USERPROFILE" `
+        "DSH_HOME=$dshHome" `
+        "PATH=C:\Windows\System32;C:\Windows;$nodeDir" | Out-Null
+    & $nssm set $svcName AppStdout (Join-Path $logsDir 'dsh-web.out.log') | Out-Null
+    & $nssm set $svcName AppStderr (Join-Path $logsDir 'dsh-web.err.log') | Out-Null
+    & $nssm set $svcName AppRotateFiles 1 | Out-Null
+    & $nssm set $svcName AppRotateBytes 10485760 | Out-Null   # 10 MB per log
+    & $nssm set $svcName AppRestartDelay 5000 | Out-Null      # 5s before restart after crash
+    & $nssm set $svcName Description 'DeepSeek Harness web UI (dsh web) auto-start service' | Out-Null
+    & $nssm set $svcName Start SERVICE_AUTO_START | Out-Null
+    Write-Log 'service configured (auto start at boot, crash auto-restart, log rotation).'
 
-function Invoke-Stop {
-    # stop the task first (kills the launcher tree), then kill any leftover listener
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $pid_ = Get-PortOwner -P $Port
-    if ($pid_) {
-        Write-Log "killing pid $pid_ (listener on port $Port)"
-        Stop-Process -Id $pid_ -Force -ErrorAction SilentlyContinue
-    }
-    Write-Log "stopped."
-}
-
-function Invoke-Status {
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($task) {
-        Write-Host ("task '{0}': {1}" -f $TaskName, $task.State)
-    } else {
-        Write-Host "task '$TaskName': NOT installed"
-    }
-    $pid_ = Get-PortOwner -P $Port
-    if ($pid_) { Write-Host "port $Port : listening (pid $pid_)" }
-    else       { Write-Host "port $Port : free" }
-    if (Test-Path -LiteralPath $configPath) { Write-Host ("dsh version: {0}" -f (Get-DshVersion)) }
-    if (Test-Path -LiteralPath $serviceLog) { Write-Host "log: $serviceLog" }
-}
-
-function Invoke-Uninstall {
-    Write-Log "uninstalling dsh web auto-start"
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    $pid_ = Get-PortOwner -P $Port
-    if ($pid_) {
-        Write-Log "killing pid $pid_ (listener on port $Port)"
-        Stop-Process -Id $pid_ -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath $svcDir) {
-        Remove-Item -LiteralPath $svcDir -Recurse -Force
-        Write-Log "removed $svcDir"
-    }
-    if ($RemoveGlobalDsh) {
-        Write-Log "removing global @deepseek-ai/dsh"
-        & npm uninstall -g @deepseek-ai/dsh
-    }
-    Write-Log "done."
-}
-
-function Invoke-TestStart {
-    if (-not (Test-Path -LiteralPath $launcher)) { throw "not installed yet; run: .\install.ps1 install" }
-    $existing = Get-PortOwner -P $TestPort
-    if ($existing) { throw "port $TestPort already in use (pid $existing); pick another with -TestPort" }
-
-    Write-Host "spawning dsh web on 127.0.0.1:$TestPort (spare port; does not touch port $Port)..."
-    & $launcher -Port $TestPort -NoBlock
-    if ($LASTEXITCODE -ne 0) { throw "launcher failed to spawn dsh web (exit $LASTEXITCODE); see $svcDir\dsh-web.log" }
+    # 6) start + verify
+    Write-Log 'starting service...'
+    & $nssm start $svcName
+    if ($LASTEXITCODE -ne 0) { throw "nssm start failed (exit $LASTEXITCODE); check $logsDir\dsh-web.err.log" }
 
     $ok = $false
     for ($i = 1; $i -le 30; $i++) {
         Start-Sleep -Seconds 1
         try {
-            $r = Invoke-WebRequest -Uri "http://127.0.0.1:$TestPort" -UseBasicParsing -TimeoutSec 2
-            if ($r.StatusCode -lt 400) {
-                Write-Host ("HTTP {0} after {1}s -- launch chain OK" -f $r.StatusCode, $i)
-                $ok = $true
-                break
-            }
+            $r = Invoke-WebRequest -Uri "http://${HostAddr}:$Port" -UseBasicParsing -TimeoutSec 2
+            if ($r.StatusCode -lt 400) { Write-Log "OK: HTTP $($r.StatusCode) after ${i}s -- dsh web is up"; $ok = $true; break }
         } catch { }
     }
-
-    # tear the test instance down
-    $tp = Get-PortOwner -P $TestPort
-    if ($tp) {
-        Stop-Process -Id $tp -Force -ErrorAction SilentlyContinue
-        Write-Host "test instance stopped (pid $tp)"
-    }
     if (-not $ok) {
-        Write-Host "WARNING: no HTTP response on :$TestPort within 30s; inspect $svcDir\dsh-web.stderr.log"
+        Write-Log "WARNING: no HTTP response on ${HostAddr}:$Port within 30s; see $logsDir\dsh-web.err.log"
         exit 1
     }
+
+    Write-Host ''
+    Write-Host '安装完成 ✅  服务名: dsh-web  (开机自动启动)'
+    Write-Host '  手动重启 : net stop dsh-web && net start dsh-web'
+    Write-Host '            或 services.msc 中找到 "dsh-web" 右键重启'
+    Write-Host '            或 Restart-Service dsh-web'
+    Write-Host "  日志     : $logsDir"
+}
+
+function Invoke-Start {
+    if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) { throw "service '$svcName' not installed; run install first" }
+    sc.exe start $svcName | Out-Null
+    Write-Log 'service started.'
+}
+
+function Invoke-Stop {
+    if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) { sc.exe stop $svcName 2>$null | Out-Null }
+    $owner = Get-PortOwner -P $Port
+    if ($owner) { Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue }
+    Write-Log 'stopped.'
+}
+
+function Invoke-Restart {
+    if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) { sc.exe stop $svcName 2>$null | Out-Null }
+    Start-Sleep -Seconds 1
+    if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) { sc.exe start $svcName | Out-Null }
+    Write-Log 'restarted.'
+}
+
+function Invoke-Status {
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($svc) { Write-Host ("service '{0}': {1}  (StartType={2})" -f $svcName, $svc.Status, $svc.StartType) }
+    else      { Write-Host "service '$svcName': NOT installed" }
+    $owner = Get-PortOwner -P $Port
+    if ($owner) { Write-Host "port $Port : listening (pid $owner)" }
+    else        { Write-Host "port $Port : free" }
+    $logsDir = Join-Path $svcDir 'logs'
+    if (Test-Path (Join-Path $logsDir 'dsh-web.out.log')) { Write-Host "logs: $logsDir" }
+}
+
+function Invoke-Uninstall {
+    Write-Log 'uninstalling dsh-web service...'
+    if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
+        sc.exe stop $svcName 2>$null | Out-Null
+        sc.exe delete $svcName 2>$null | Out-Null
+    }
+    $owner = Get-PortOwner -P $Port
+    if ($owner) { Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue }
+    Write-Log 'service removed. Files under %LOCALAPPDATA%\dsh-service kept (logs); delete manually if unwanted.'
 }
 
 # ---- dispatch --------------------------------------------------------------
 switch ($Command) {
-    'install'    { Invoke-Install }
-    'start'      { Invoke-Start }
-    'stop'       { Invoke-Stop }
-    'restart'    { Invoke-Stop; Invoke-Start }
-    'status'     { Invoke-Status }
-    'uninstall'  { Invoke-Uninstall }
-    'test-start' { Invoke-TestStart }
+    'install'   { Invoke-Install; if ($Host.UI.RawUI) { Read-Host '按回车关闭窗口' } }
+    'start'     { Invoke-Start }
+    'stop'      { Invoke-Stop }
+    'restart'   { Invoke-Restart }
+    'status'    { Invoke-Status }
+    'uninstall' { Invoke-Uninstall }
 }
