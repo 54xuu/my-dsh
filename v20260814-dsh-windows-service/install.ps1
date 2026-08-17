@@ -58,8 +58,7 @@ $svcDir  = Join-Path $env:LOCALAPPDATA 'dsh-service'
 $logFile = Join-Path $svcDir 'install.log'
 
 # ---- self-elevate via UAC -------------------------------------------------
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())
-    .IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), $Command)
     if ($PSBoundParameters.ContainsKey('Port'))     { $argList += @('-Port', "$Port") }
